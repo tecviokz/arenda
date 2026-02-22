@@ -1,176 +1,215 @@
+import asyncio
+import logging
+import os
+import sqlite3
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import Command
-from aiogram.fsm.state import StatesGroup, State
+from aiogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery
+)
+from aiogram.filters import CommandStart, Command
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-import asyncio
 
-TOKEN = "8510821400:AAH18mLbKAEMTavsa_VpE3-QUDU-p7lKCGI"
-ADMINS = [1925179708]  # твой ID
+logging.basicConfig(level=logging.INFO)
 
-bot = Bot(TOKEN)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS = [1925179708]  # <-- ВСТАВЬ СВОЙ TELEGRAM ID
+
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# ======= ПРОСТАЯ БАЗА =======
-users = set()
-active_numbers = {}  # {user_id: phone}
-pending_codes = {}   # {user_id: last_code}
+# ================= DATABASE =================
 
-# ======= FSM =======
-class SubmitNumber(StatesGroup):
-    waiting_for_number = State()
+conn = sqlite3.connect("database.db")
+cursor = conn.cursor()
 
-class AdminSendCode(StatesGroup):
-    waiting_for_code = State()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    username TEXT,
+    number TEXT,
+    status TEXT
+)
+""")
 
-class BroadcastState(StatesGroup):
-    waiting_for_message = State()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+)
+""")
 
-# ======= КНОПКИ =======
+cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('price', '50₽')")
+conn.commit()
+
+# ================= FSM =================
+
+class RentState(StatesGroup):
+    waiting_number = State()
+
+# ================= КНОПКИ =================
+
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📲 Сдать номер", callback_data="submit_number")],
-        [InlineKeyboardButton(text="🛟 Поддержка", callback_data="support")]
+        [InlineKeyboardButton(text="📱 Арендовать", callback_data="rent")],
+        [InlineKeyboardButton(text="💰 Прайс", callback_data="price")],
+        [InlineKeyboardButton(text="📊 Очередь", callback_data="queue")],
+        [InlineKeyboardButton(text="🛠 Поддержка", callback_data="support")]
     ])
 
-def code_buttons():
+def status_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Встал", callback_data="done"),
-         InlineKeyboardButton(text="🔁 Повтор", callback_data="repeat")]
+        [
+            InlineKeyboardButton(text="✅ Встал", callback_data="done"),
+            InlineKeyboardButton(text="🔁 Повтор", callback_data="repeat")
+        ]
     ])
 
-def admin_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
-        [InlineKeyboardButton(text="📨 Рассылка", callback_data="broadcast")],
-        [InlineKeyboardButton(text="🧹 Очистить активные", callback_data="clear")]
-    ])
+# ================= START =================
 
-# ======= СТАРТ =======
-@dp.message(Command("start"))
+@dp.message(CommandStart())
 async def start(message: Message):
-    users.add(message.from_user.id)
-    await message.answer("👋 Добро пожаловать!\nВыберите действие:", reply_markup=main_menu())
+    await message.answer(
+        "👋 Добро пожаловать!\n\nВыберите действие:",
+        reply_markup=main_menu()
+    )
 
-# ======= СДАТЬ НОМЕР =======
-@dp.callback_query(F.data=="submit_number")
-async def submit_number(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id in active_numbers:
-        await call.message.answer("❗ У вас уже есть активный номер.")
+# ================= АРЕНДА =================
+
+@dp.callback_query(F.data == "rent")
+async def rent(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("📩 Введите номер в формате +79999999999")
+    await state.set_state(RentState.waiting_number)
+    await callback.answer()
+
+@dp.message(RentState.waiting_number)
+async def get_number(message: Message, state: FSMContext):
+    number = message.text.strip()
+
+    if not number.startswith("+") or not number[1:].isdigit():
+        await message.answer("❌ Неверный формат номера.")
         return
-    await call.message.answer("📲 Отправьте номер в формате +7700...")
-    await state.set_state(SubmitNumber.waiting_for_number)
 
-@dp.message(SubmitNumber.waiting_for_number)
-async def process_number(message: Message, state: FSMContext):
-    phone = message.text.strip()
-    active_numbers[message.from_user.id] = phone
-    users.add(message.from_user.id)
+    cursor.execute(
+        "INSERT INTO queue (user_id, username, number, status) VALUES (?, ?, ?, ?)",
+        (message.from_user.id, message.from_user.username, number, "waiting")
+    )
+    conn.commit()
 
-    text = f"📥 Новый номер\n\n📱 {phone}\n👤 @{message.from_user.username}\n🆔 {message.from_user.id}"
-    for admin in ADMINS:
-        await bot.send_message(admin, text)
+    for admin in ADMIN_IDS:
+        await bot.send_message(
+            admin,
+            f"📥 Новый номер\n\n👤 @{message.from_user.username}\n🆔 {message.from_user.id}\n📱 {number}"
+        )
 
-    await message.answer("✅ Номер отправлен админу.")
+    await message.answer("⏳ Номер добавлен в очередь.")
     await state.clear()
 
-# ======= ОТПРАВКА КОДА АДМИНОМ =======
+# ================= ПРАЙС =================
+
+@dp.callback_query(F.data == "price")
+async def price(callback: CallbackQuery):
+    cursor.execute("SELECT value FROM settings WHERE key='price'")
+    price = cursor.fetchone()[0]
+    await callback.message.answer(f"💰 Текущий прайс: {price}")
+    await callback.answer()
+
+# ================= ОЧЕРЕДЬ =================
+
+@dp.callback_query(F.data == "queue")
+async def show_queue(callback: CallbackQuery):
+    cursor.execute("SELECT COUNT(*) FROM queue WHERE status='waiting'")
+    count = cursor.fetchone()[0]
+    await callback.message.answer(f"📊 В очереди: {count} номеров")
+    await callback.answer()
+
+# ================= ПОДДЕРЖКА =================
+
+@dp.callback_query(F.data == "support")
+async def support(callback: CallbackQuery):
+    await callback.message.answer("✍️ Напишите сообщение для поддержки.")
+    await callback.answer()
+
+@dp.message()
+async def support_message(message: Message):
+    if message.from_user.id in ADMIN_IDS:
+        return
+
+    for admin in ADMIN_IDS:
+        await bot.send_message(
+            admin,
+            f"🛠 Поддержка от @{message.from_user.username}:\n\n{message.text}"
+        )
+
+# ================= ОТПРАВКА КОДА =================
+
 @dp.message(Command("code"))
-async def send_code_command(message: Message, state: FSMContext):
-    if message.from_user.id not in ADMINS:
+async def send_code(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
         return
+
     try:
-        user_id = int(message.text.split()[1])
+        _, user_id, code = message.text.split(maxsplit=2)
+
+        await bot.send_message(
+            int(user_id),
+            f"🔐 Ваш код:\n\n{code}",
+            reply_markup=status_kb()
+        )
+
+        await message.answer("✅ Код отправлен.")
     except:
-        await message.answer("❗ Используй: /code USER_ID")
+        await message.answer("Используй: /code user_id код")
+
+# ================= ВСТАЛ / ПОВТОР =================
+
+@dp.callback_query(F.data == "done")
+async def done(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "✅ Отлично!\n\nНе забудьте добавить номер в отчёт и указать username."
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "repeat")
+async def repeat(callback: CallbackQuery):
+    for admin in ADMIN_IDS:
+        await bot.send_message(
+            admin,
+            f"🔁 Повтор кода\n\n👤 @{callback.from_user.username}\n🆔 {callback.from_user.id}"
+        )
+    await callback.answer("Администратор уведомлён")
+
+# ================= АДМИН КОМАНДЫ =================
+
+@dp.message(Command("setprice"))
+async def set_price(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
         return
-    if user_id not in active_numbers:
-        await message.answer("❗ У пользователя нет активного номера.")
+
+    try:
+        _, new_price = message.text.split(maxsplit=1)
+        cursor.execute("UPDATE settings SET value=? WHERE key='price'", (new_price,))
+        conn.commit()
+        await message.answer("💰 Прайс обновлён.")
+    except:
+        await message.answer("Используй: /setprice 60₽")
+
+@dp.message(Command("clearqueue"))
+async def clear_queue(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
         return
-    await state.update_data(target_user=user_id)
-    await message.answer("🔑 Введите код:")
-    await state.set_state(AdminSendCode.waiting_for_code)
 
-@dp.message(AdminSendCode.waiting_for_code)
-async def process_code(message: Message, state: FSMContext):
-    if message.from_user.id not in ADMINS:
-        return
-    data = await state.get_data()
-    user_id = data.get("target_user")
-    code = message.text.strip()
-    pending_codes[user_id] = code
-    await bot.send_message(user_id, f"🔑 Ваш код:\n{code}", reply_markup=code_buttons())
-    await message.answer("✅ Код отправлен пользователю.")
-    await state.clear()
+    cursor.execute("DELETE FROM queue")
+    conn.commit()
+    await message.answer("🗑 Очередь очищена.")
 
-# ======= КНОПКИ ПОЛЬЗОВАТЕЛЯ =======
-@dp.callback_query(F.data=="repeat")
-async def repeat_code(call: CallbackQuery):
-    user_id = call.from_user.id
-    if user_id not in active_numbers:
-        return
-    phone = active_numbers[user_id]
-    text = f"🔁 Пользователь просит повтор\n📱 {phone}\n👤 @{call.from_user.username}\n🆔 {user_id}"
-    for admin in ADMINS:
-        await bot.send_message(admin, text)
-    await call.answer("Запрос отправлен админу.")
+# ================= ЗАПУСК =================
 
-@dp.callback_query(F.data=="done")
-async def done(call: CallbackQuery):
-    user_id = call.from_user.id
-    if user_id in active_numbers:
-        del active_numbers[user_id]
-    await call.message.edit_text("✅ Отлично!\nПожалуйста, не забудьте:\n— Добавить номер в отчёт\n— Указать свой username")
-
-# ======= АДМИН ПАНЕЛЬ =======
-@dp.message(Command("admin"))
-async def admin_panel(message: Message):
-    if message.from_user.id not in ADMINS:
-        return
-    await message.answer("👑 Админ панель:", reply_markup=admin_menu())
-
-@dp.callback_query(F.data=="stats")
-async def stats(call: CallbackQuery):
-    if call.from_user.id not in ADMINS:
-        return
-    await call.message.answer(f"📊 Статистика\n👥 Пользователей: {len(users)}\n📲 Активных номеров: {len(active_numbers)}")
-
-@dp.callback_query(F.data=="clear")
-async def clear_active(call: CallbackQuery):
-    if call.from_user.id not in ADMINS:
-        return
-    active_numbers.clear()
-    await call.message.answer("🧹 Активные номера очищены.")
-
-# ======= РАССЫЛКА =======
-@dp.callback_query(F.data=="broadcast")
-async def broadcast_start(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id not in ADMINS:
-        return
-    await call.message.answer("📨 Отправьте сообщение для рассылки:")
-    await state.set_state(BroadcastState.waiting_for_message)
-
-@dp.message(BroadcastState.waiting_for_message)
-async def process_broadcast(message: Message, state: FSMContext):
-    if message.from_user.id not in ADMINS:
-        return
-    text = message.text
-    for user in users:
-        try:
-            await bot.send_message(user, text)
-        except:
-            pass
-    await message.answer("✅ Рассылка завершена.")
-    await state.clear()
-
-# ======= ПОДДЕРЖКА =======
-@dp.callback_query(F.data=="support")
-async def support(call: CallbackQuery):
-    await call.message.answer("✍️ Напишите сообщение для поддержки. Оно придёт админам.")
-    # Пользователь просто пишет, админу отправляется через reply вручную
-
-# ======= ЗАПУСК =======
 async def main():
     await dp.start_polling(bot)
 
